@@ -10,9 +10,10 @@ app.use(express.json());
 const SHOP_ID = process.env.SHOP_ID;
 const SECRET_KEY = process.env.SECRET_KEY;
 
+// Генерируем заголовок авторизации в формате Basic
 const basicAuth = Buffer.from(`${SHOP_ID}:${SECRET_KEY}`).toString('base64');
 
-// Главная страница — проверка что всё работает
+// Главная страница (проверка работы сервера)
 app.get('/', (req, res) => {
   res.send('🚀 Сервер YoоKassa работает. Используй POST /create-payment и GET /check-payment/:id');
 });
