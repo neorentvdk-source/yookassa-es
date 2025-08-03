@@ -12,11 +12,17 @@ const SECRET_KEY = process.env.SECRET_KEY;
 
 const basicAuth = Buffer.from(`${SHOP_ID}:${SECRET_KEY}`).toString('base64');
 
+// Главная страница — проверка что всё работает
+app.get('/', (req, res) => {
+  res.send('🚀 Сервер YoоKassa работает. Используй POST /create-payment и GET /check-payment/:id');
+});
+
+// Создание платежа
 app.post('/create-payment', async (req, res) => {
   try {
     const { amount, items, return_url } = req.body;
 
-    const idempotenceKey = uuidv4(); // Генерируем ключ идемпотентности
+    const idempotenceKey = uuidv4();
     const response = await axios.post(
       'https://api.yookassa.ru/v3/payments',
       {
@@ -58,6 +64,7 @@ app.post('/create-payment', async (req, res) => {
   }
 });
 
+// Проверка статуса платежа
 app.get('/check-payment/:id', async (req, res) => {
   try {
     const paymentId = req.params.id;
@@ -75,6 +82,7 @@ app.get('/check-payment/:id', async (req, res) => {
   }
 });
 
+// Запуск сервера
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Сервер запущен на порту ${PORT}`);
 });
