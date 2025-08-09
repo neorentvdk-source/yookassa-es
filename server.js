@@ -18,8 +18,8 @@ const INS_API_KEY = process.env.INS_API_KEY;          // InSales API key
 const INS_API_PASSWORD = process.env.INS_API_PASSWORD;// InSales API password
 const PORT = process.env.PORT || 3000;
 
-// Доп. настройки чека
-const RECEIPT_VAT_CODE = Number(process.env.RECEIPT_VAT_CODE || 4);   // 1=20%,2=10%,3=0%,4=без НДС,5=20/120,6=10/110
+// чек: НДС и СНО (можно задать в Render → Environment)
+const RECEIPT_VAT_CODE = Number(process.env.RECEIPT_VAT_CODE || 4);     // 1=20%,2=10%,3=0%,4=без НДС,5=20/120,6=10/110
 const RECEIPT_TAX_SYSTEM = Number(process.env.RECEIPT_TAX_SYSTEM || 0); // 0=не передавать; 1..6 — СНО
 
 if (!SHOP_ID || !SECRET_KEY || !INS_DOMAIN || !INS_API_KEY || !INS_API_PASSWORD) {
@@ -38,6 +38,59 @@ const insales = axios.create({
 // ====== helpers ======
 const money = (v) => Number(v || 0).toFixed(2);
 
+// Нормализация телефона под форматы, которые принимает ЮKassa
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const digitsPlus = String(raw).replace(/[^\d+]/g, '');
+  if (!digitsPlus) return null;
+
+  if (digitsPlus.startsWith('+')) {
+    const only = digitsPlus.replace(/[^\d]/g, '');
+    if (only.length >= 11) return digitsPlus;
+  }
+  const only = digitsPlus.replace(/[^\d]/g, '');
+  if (only.length === 11 && only.startsWith('8')) return '+7' + only.slice(1);
+  if (only.length === 11 && only.startsWith('7')) return '+' + only;
+  if (only.length === 10) return '+7' + only;
+  return null;
+}
+
+// Универсальный сбор контактов из всех типичных мест InSales
+function pickCustomer(order) {
+  const emails = [
+    order?.email,
+    order?.notification_email,          // из твоего примера
+    order?.client?.email,
+    order?.customer?.email,
+    order?.user?.email,
+    order?.contact_email,
+    order?.shipping_address?.email,
+    order?.delivery_address?.email,
+    order?.billing_address?.email
+  ].filter(Boolean);
+
+  const phonesRaw = [
+    order?.phone,
+    order?.contact_phone,               // из твоего примера
+    order?.client?.phone,
+    order?.customer?.phone,
+    order?.user?.phone,
+    order?.shipping_address?.phone,
+    order?.delivery_address?.phone,
+    order?.billing_address?.phone
+  ].filter(Boolean);
+
+  const email = emails.find(e => String(e).includes('@')) || null;
+
+  let phone = null;
+  for (const p of phonesRaw) {
+    const norm = normalizePhone(p);
+    if (norm) { phone = norm; break; }
+  }
+
+  return { email, phone };
+}
+
 // Получаем заказ из InSales по ID
 async function fetchOrder(orderId) {
   const { data } = await insales.get(`/admin/orders/${orderId}.json`);
@@ -52,16 +105,14 @@ async function fetchVariantInfo(productId, variantId) {
   return { barcode: v?.barcode || null, sku: v?.sku || null };
 }
 
-/**
- * Преобразуем строки заказа → YooKassa articles[]
- * TRU берём из SKU (артикул). Если нет — variant.sku, затем barcode.
- */
+/** Преобразуем строки заказа → YooKassa articles[] */
 async function buildArticlesFromOrder(order) {
   const lines = order.line_items || order.order_lines || [];
   const out = [];
   let idx = 1;
 
   for (const li of lines) {
+    // TRU: сначала SKU, потом variant.sku, потом barcode (fallback)
     let tru = li.sku || li?.variant?.sku || null;
 
     if (!tru && li.product_id && li.variant_id) {
@@ -79,7 +130,7 @@ async function buildArticlesFromOrder(order) {
 
     out.push({
       article_number: idx++,
-      tru_code: String(tru), // здесь должен быть реальный TRU/GTIN
+      tru_code: String(tru), // должен быть реальный TRU/GTIN
       article_code: String(li.variant_id ?? li.product_id ?? li.sku ?? ''),
       article_name: String(li.title || 'Товар'),
       quantity,
@@ -95,37 +146,34 @@ function amountFromArticles(articles) {
   return money(sum);
 }
 
-/**
- * Формируем чек (receipt) по 54-ФЗ.
- * items[].amount.value — ЦЕНА ЗА ЕДИНИЦУ, quantity — количество.
- * vat_code — из RECEIPT_VAT_CODE (по умолчанию 4 — без НДС).
- */
+/** Формируем чек (receipt) по 54-ФЗ */
 function buildReceiptFromOrder(order) {
-  const lines = order.line_items || order.order_lines || [];
-  const items = [];
+  const { email, phone } = pickCustomer(order);
+  if (!email && !phone) {
+    console.warn('No customer contacts in order');
+    return null;
+  }
 
-  for (const li of lines) {
+  const lines = order.line_items || order.order_lines || [];
+  const items = lines.map(li => {
     const qty = Number(li.quantity || 1);
     const unitPrice = money(li.sale_price ?? li.price ?? 0);
     const name = String(li.title || 'Товар').slice(0, 128);
-    items.push({
+    return {
       description: name,
       quantity: qty,
       amount: { value: unitPrice, currency: 'RUB' },
       vat_code: RECEIPT_VAT_CODE,
-      // при необходимости можно добавить:
+      // при необходимости можно раскомментировать:
       // payment_mode: 'full_payment',
       // payment_subject: 'commodity',
-    });
-  }
+    };
+  });
 
   const receipt = { customer: {}, items };
+  if (email) receipt.customer.email = email;
+  if (phone) receipt.customer.phone = phone;
 
-  // Контакты покупателя (что есть в заказе)
-  if (order.email) receipt.customer.email = String(order.email);
-  if (order.phone) receipt.customer.phone = String(order.phone);
-
-  // СНО (если нужна)
   if (RECEIPT_TAX_SYSTEM >= 1 && RECEIPT_TAX_SYSTEM <= 6) {
     receipt.tax_system_code = RECEIPT_TAX_SYSTEM;
   }
@@ -135,7 +183,7 @@ function buildReceiptFromOrder(order) {
 
 // ====== ROUTES ======
 
-// Health-check переменных окружения (секреты не раскрываем)
+// Проверка ENV
 app.get('/env-check', (req, res) => {
   res.json({
     SHOP_ID: !!process.env.SHOP_ID,
@@ -149,15 +197,15 @@ app.get('/env-check', (req, res) => {
   });
 });
 
-// ТЕСТ: показать ключевые поля заказа (sku/barcode)
+// ТЕСТ: показать ключевые поля заказа + найденные контакты
 app.get('/test-order/:id', async (req, res) => {
   try {
     const order = await fetchOrder(req.params.id);
+    const contact = pickCustomer(order);
     res.json({
       order_id: order.id,
       number: order.number,
-      email: order.email || null,
-      phone: order.phone || null,
+      customer_detected: { email: contact.email || null, phone: contact.phone || null },
       lines: (order.line_items || order.order_lines || []).map(li => ({
         title: li.title,
         quantity: li.quantity,
@@ -176,18 +224,17 @@ app.get('/test-order/:id', async (req, res) => {
   }
 });
 
-// Стартовая страница
 app.get('/', (req, res) => {
   res.send('🚀 YooKassa ES: POST /insales/start | GET /pay-by-es?order_id=...&return_url=... | GET /test-order/:id | GET /env-check');
 });
 
-// Диагностический /insales/start (InSales POST или ручной GET ?order_id=)
+// InSales POST или ручной GET ?order_id=
 app.all('/insales/start', async (req, res) => {
   try {
     const method = req.method;
     console.log('[/insales/start] method=', method, 'ct=', req.headers['content-type']);
 
-    // 1) Получаем заказ
+    // 1) заказ
     let orderObj = null;
     if (method === 'POST' && (req.body?.order_json)) {
       console.log('[/insales/start] body keys:', Object.keys(req.body));
@@ -200,13 +247,11 @@ app.all('/insales/start', async (req, res) => {
     }
 
     if (!orderObj?.id) {
-      console.error('[/insales/start] no order_json or no id');
       return res.status(400).send('Нет данных заказа: нужен POST с order_json (InSales) или GET c ?order_id=');
     }
 
     // 2) articles
     const articles = await buildArticlesFromOrder(orderObj);
-    console.log('[/insales/start] articles count=', articles.length);
     if (!articles.length) {
       return res.status(400).send('В заказе нет позиций с TRU (проверь SKU/штрихкоды у вариантов)');
     }
@@ -214,9 +259,11 @@ app.all('/insales/start', async (req, res) => {
     // 3) сумма + чек
     const amount = amountFromArticles(articles);
     const receipt = buildReceiptFromOrder(orderObj);
-    console.log('[/insales/start] amount=', amount, 'receipt.items=', receipt.items.length);
+    if (!receipt) {
+      return res.status(400).send('В заказе не найден телефон или e-mail (для чека). Включи обязательное поле в оформлении заказа.');
+    }
 
-    // 4) платёж в YooKassa (articles — top-level, receipt обязателен)
+    // 4) YooKassa (articles — top-level, receipt обязателен)
     const idempotenceKey = uuidv4();
     const { data: pay } = await axios.post(
       'https://api.yookassa.ru/v3/payments',
@@ -260,7 +307,7 @@ app.all('/insales/start', async (req, res) => {
   }
 });
 
-// Ручной сценарий (для отладки)
+// Ручной сценарий
 app.get('/pay-by-es', async (req, res) => {
   const { order_id, return_url } = req.query;
   if (!order_id || !return_url) {
@@ -276,6 +323,9 @@ app.get('/pay-by-es', async (req, res) => {
 
     const amount = amountFromArticles(articles);
     const receipt = buildReceiptFromOrder(order);
+    if (!receipt) {
+      return res.status(400).send('В заказе не найден телефон или e-mail (для чека).');
+    }
 
     const idempotenceKey = uuidv4();
     const { data: pay } = await axios.post(
