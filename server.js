@@ -40,42 +40,43 @@ async function fetchOrder(orderId) {
   return data.order ? data.order : data;
 }
 
-// Получаем штрихкод варианта из карточки товара, если нет в строке заказа
-async function fetchVariantBarcode(productId, variantId) {
+// Получаем sku/barcode варианта из карточки товара
+async function fetchVariantInfo(productId, variantId) {
   const { data } = await insales.get(`/admin/products/${productId}.json`);
   const product = data.product ? data.product : data;
   const v = (product.variants || []).find(x => String(x.id) === String(variantId));
-  return v?.barcode || null;
+  return { barcode: v?.barcode || null, sku: v?.sku || null };
 }
 
-// Преобразуем строки заказа → YooKassa articles[]
+/**
+ * Преобразуем строки заказа → YooKassa articles[]
+ * TRU берём из SKU (артикул). Если нет — variant.sku, затем barcode.
+ */
 async function buildArticlesFromOrder(order) {
   const lines = order.line_items || order.order_lines || [];
   const out = [];
   let idx = 1;
 
   for (const li of lines) {
-    // TRU-код (штрихкод)
-    let tru = li.barcode || li?.variant?.barcode || null;
+    let tru = li.sku || li?.variant?.sku || null;
 
     if (!tru && li.product_id && li.variant_id) {
       try {
-        tru = await fetchVariantBarcode(li.product_id, li.variant_id);
-      } catch (_) { /* пропускаем ошибку */ }
+        const vi = await fetchVariantInfo(li.product_id, li.variant_id);
+        tru = vi.sku || vi.barcode || null;
+      } catch (_) {}
     }
+    if (!tru) tru = li.barcode || li?.variant?.barcode || null;
 
-    if (!tru) {
-      // Без штрихкода строку пропускаем (ЭС не примет)
-      continue;
-    }
+    if (!tru) continue; // строку без TRU пропускаем
 
     const quantity = Number(li.quantity || 1);
     const unitPrice = money(li.sale_price ?? li.price ?? 0);
 
     out.push({
       article_number: idx++,
-      tru_code: String(tru),
-      article_code: String(li.sku ?? li.variant_id ?? ''), // артикул/sku
+      tru_code: String(tru), // здесь должен быть реальный TRU/GTIN
+      article_code: String(li.variant_id ?? li.product_id ?? li.sku ?? ''),
       article_name: String(li.title || 'Товар'),
       quantity,
       price: { value: unitPrice, currency: 'RUB' },
@@ -92,7 +93,7 @@ function amountFromArticles(articles) {
 
 // ====== ROUTES ======
 
-// Health-check переменных окружения (НЕ показывает секреты)
+// Health-check переменных окружения (секреты не раскрываем)
 app.get('/env-check', (req, res) => {
   res.json({
     SHOP_ID: !!process.env.SHOP_ID,
@@ -104,23 +105,23 @@ app.get('/env-check', (req, res) => {
   });
 });
 
-// ✅ ТЕСТ: Посмотреть сырой заказ из InSales и глазами увидеть штрихкоды
+// ТЕСТ: показать ключевые поля заказа (sku/barcode)
 app.get('/test-order/:id', async (req, res) => {
   try {
     const order = await fetchOrder(req.params.id);
     res.json({
       order_id: order.id,
       number: order.number,
-      // Покажем ключевые поля по позициям
       lines: (order.line_items || order.order_lines || []).map(li => ({
         title: li.title,
         quantity: li.quantity,
         price: li.sale_price ?? li.price,
+        sku_in_line: li.sku || null,
+        variant_sku: li?.variant?.sku || null,
         barcode_in_line: li.barcode || null,
         variant_barcode: li?.variant?.barcode || null,
         product_id: li.product_id || null,
-        variant_id: li.variant_id || null,
-        sku: li.sku || null
+        variant_id: li.variant_id || null
       }))
     });
   } catch (e) {
@@ -129,40 +130,64 @@ app.get('/test-order/:id', async (req, res) => {
   }
 });
 
-// Проверка живости
+// Стартовая страница
 app.get('/', (req, res) => {
-  res.send('🚀 YooKassa ES готов. Используй: POST /insales/start, GET /pay-by-es?order_id=XXX&return_url=..., GET /test-order/:id');
+  res.send('🚀 YooKassa ES: POST /insales/start | GET /pay-by-es?order_id=...&return_url=... | GET /test-order/:id | GET /env-check');
 });
 
 /**
- * Основной маршрут для InSales: создаём платёж по ЭС и редиректим клиента на ЮKassa
- * (Подпись InSales добавим на следующем шаге.)
+ * ✅ Диагностический обработчик /insales/start:
+ * - Принимает POST от InSales (order_json)
+ * - Умеет ручной GET-тест: /insales/start?order_id=123&return_url=...
+ * - Логирует ключевые шаги
+ * - Шлёт в ЮKassa articles на ВЕРХНЕМ УРОВНЕ
+ * - В случае ошибки показывает текст ответа ЮKassa (удобно для отладки)
  */
-app.post('/insales/start', async (req, res) => {
+app.all('/insales/start', async (req, res) => {
   try {
-    const { order_json } = req.body;
+    const method = req.method;
+    console.log('[/insales/start] method=', method, 'ct=', req.headers['content-type']);
 
-    const orderObj = typeof order_json === 'string' ? JSON.parse(order_json) : order_json;
+    // 1) Получаем заказ
+    let orderObj = null;
+
+    if (method === 'POST' && (req.body?.order_json)) {
+      console.log('[/insales/start] body keys:', Object.keys(req.body));
+      orderObj = typeof req.body.order_json === 'string'
+        ? JSON.parse(req.body.order_json)
+        : req.body.order_json;
+    } else if (method === 'GET' && req.query.order_id) {
+      console.log('[/insales/start] GET order_id=', req.query.order_id);
+      orderObj = await fetchOrder(req.query.order_id);
+    }
+
     if (!orderObj?.id) {
-      return res.status(400).send('Нет order_json или order_json.id');
+      console.error('[/insales/start] no order_json or no id');
+      return res.status(400).send('Нет данных заказа: нужен POST с order_json (InSales) или GET c ?order_id=');
     }
 
+    // 2) Собираем articles
     const articles = await buildArticlesFromOrder(orderObj);
+    console.log('[/insales/start] articles count=', articles.length);
     if (!articles.length) {
-      return res.status(400).send('В заказе нет позиций с TRU-кодом (штрихкодом)');
+      return res.status(400).send('В заказе нет позиций с TRU (проверь SKU/штрихкоды у вариантов)');
     }
 
+    // 3) Сумма
     const amount = amountFromArticles(articles);
+    console.log('[/insales/start] amount=', amount);
 
+    // 4) Платёж в ЮKassa (articles — top-level!)
     const idempotenceKey = uuidv4();
     const { data: pay } = await axios.post(
       'https://api.yookassa.ru/v3/payments',
       {
         amount: { value: amount, currency: 'RUB' },
-        payment_method_data: { type: 'electronic_certificate', articles },
+        payment_method_data: { type: 'electronic_certificate' },
+        articles,
         confirmation: {
           type: 'redirect',
-          return_url: `https://${INS_DOMAIN}/account/orders`
+          return_url: req.query.return_url || `https://${INS_DOMAIN}/account/orders`
         },
         capture: true,
         description: `Заказ №${orderObj.number || orderObj.id} (ЭС)`,
@@ -180,17 +205,22 @@ app.post('/insales/start', async (req, res) => {
 
     const confirmationUrl = pay?.confirmation?.confirmation_url;
     if (!confirmationUrl) {
+      console.error('[/insales/start] No confirmation_url. YooKassa resp:', pay);
       return res.status(502).send('ЮKassa не вернула confirmation_url');
     }
 
+    console.log('[/insales/start] redirect to', confirmationUrl);
     return res.redirect(302, confirmationUrl);
   } catch (e) {
-    console.error('insales/start error:', e?.response?.data || e.message);
-    return res.status(500).send('Ошибка создания платежа из InSales');
+    const err = e?.response?.data || e.message;
+    console.error('[/insales/start] ERROR:', err);
+    return res
+      .status(500)
+      .send('Ошибка создания платежа из InSales: ' + (typeof err === 'string' ? err : JSON.stringify(err)));
   }
 });
 
-// Ручной сценарий — оставить для отладки
+// Ручной сценарий (оставлен для отладки)
 app.get('/pay-by-es', async (req, res) => {
   const { order_id, return_url } = req.query;
   if (!order_id || !return_url) {
@@ -201,9 +231,7 @@ app.get('/pay-by-es', async (req, res) => {
     const order = await fetchOrder(order_id);
     const articles = await buildArticlesFromOrder(order);
     if (!articles.length) {
-      return res
-        .status(400)
-        .send('В заказе нет ни одной позиции с TRU-кодом (штрихкодом). Проверь штрихкоды у вариантов.');
+      return res.status(400).send('В заказе нет позиций с TRU (проверь SKU/штрихкоды у вариантов)');
     }
 
     const amount = amountFromArticles(articles);
@@ -213,7 +241,8 @@ app.get('/pay-by-es', async (req, res) => {
       'https://api.yookassa.ru/v3/payments',
       {
         amount: { value: amount, currency: 'RUB' },
-        payment_method_data: { type: 'electronic_certificate', articles },
+        payment_method_data: { type: 'electronic_certificate' },
+        articles,
         confirmation: { type: 'redirect', return_url },
         capture: true,
         description: `Заказ №${order.number || order.id}`,
